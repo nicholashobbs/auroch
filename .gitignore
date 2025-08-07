@@ -1,0 +1,8 @@
+# Ignore Python bytecode caches
+__pycache__/
+gui/__pycache__/
+gui/widgets/__pycache__/
+
+# Ignore test and host directories
+test/
+host/
