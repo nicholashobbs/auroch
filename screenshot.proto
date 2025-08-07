@@ -1,0 +1,7 @@
+syntax = "proto3";
+
+message Screenshot {
+  string filename = 1;
+  bytes image_data = 2;
+  int64 timestamp = 3;
+}

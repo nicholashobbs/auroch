@@ -1,0 +1,12 @@
+--- AUROCH Action Plan Log ---
+Total Steps: 8
+
+Start Position: (320, 320)
+  - Step 1: SCROLL by (-1)
+  - Step 2: PAUSE for 0.0222s (Total Sleep: 0.02s)
+  - Step 3: SCROLL by (-1)
+  - Step 4: PAUSE for 0.0155s (Total Sleep: 0.04s)
+  - Step 5: SCROLL by (-1)
+  - Step 6: PAUSE for 0.0184s (Total Sleep: 0.06s)
+  - Step 7: SCROLL by (-1)
+  - Step 8: PAUSE for 0.0199s (Total Sleep: 0.08s)

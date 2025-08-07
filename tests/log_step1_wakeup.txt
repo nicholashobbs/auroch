@@ -1,0 +1,7 @@
+--- AUROCH Action Plan Log ---
+Total Steps: 3
+
+Start Position: (-15, 0)
+  - Step 1: REL_MOVE by (15, 0) -> New Pos: (15, 0)
+  - Step 2: PAUSE for 0.0500s (Total Sleep: 0.05s)
+  - Step 3: REL_MOVE by (-15, 0) -> New Pos: (0, 0)
