@@ -18,15 +18,11 @@ class ScreenshotViewer(Gtk.DrawingArea):
         self.drawing = False
         self.rect = None
 
-
         print("DEBUG: 1. ScreenshotViewer __init__ called.")
         
         # We must have our own window to receive events
-        # self.set_app_paintable(True)
         self.set_can_focus(True)
         self.set_focus_on_click(True)
-        #self.set_events(self.get_events() | Gdk.EventMask.ALL_EVENTS_MASK)
-
 
         # Connect the Gtk signals to our handler methods
         self.connect("draw", self.on_draw)
@@ -35,49 +31,82 @@ class ScreenshotViewer(Gtk.DrawingArea):
         self.connect("motion_notify_event", self.on_motion_notify)
         
         # Explicitly tell the widget which events to listen for
-        self.add_events(Gdk.EventMask.BUTTON_PRESS_MASK |
-                Gdk.EventMask.BUTTON_RELEASE_MASK |
-                Gdk.EventMask.POINTER_MOTION_MASK)
+        self.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK |
+            Gdk.EventMask.BUTTON_RELEASE_MASK |
+            Gdk.EventMask.POINTER_MOTION_MASK
+        )
 
         self.connect("realize", lambda *a: print("DEBUG: Widget realized"))
-        
-        self.boxes = []                # store all completed boxes
-        self.selected_index = None     # index of highlighted box
-        self.selection_callback = None # function to call when box finalized
+        # Ensure timer is stopped if widget is destroyed
+        self.connect("destroy", lambda *a: self._stop_dash_timer())
 
+        # store all completed boxes as dicts: {id, x, y, width, height}
+        self.boxes = []
+        self.selected_index = None     # index in self.boxes that is highlighted
+        self.selection_callback = None # function(host_ui) called with (rect_dict, index)
+
+        # Animated dash state
+        self.dash_offset = 0.0               # moving offset used for selected box dashes
+        self._dash_timer_id = None           # GLib timer source id
+        self._dash_interval_ms = 60         # update interval in ms (about ~16 FPS)
 
     def load_image(self, image_path):
         print(f"DEBUG: 3. load_image called for '{image_path}'.")
-        # ... (rest of the method is unchanged) ...
         try:
             self.pixbuf = GdkPixbuf.Pixbuf.new_from_file(image_path)
-            self.queue_draw(); return True
+            self.queue_draw()
+            return True
         except GLib.Error as e:
-            print(f"Error loading image: {e}"); return False
+            print(f"Error loading image: {e}")
+            return False
 
     def on_draw(self, widget, cr):
         allocation = self.get_allocation()
 
+        # White background (in case image is smaller)
         cr.set_source_rgb(1.0, 1.0, 1.0)
         cr.rectangle(0, 0, allocation.width, allocation.height)
         cr.fill()
 
+        # Draw screenshot
         if self.pixbuf:
             Gdk.cairo_set_source_pixbuf(cr, self.pixbuf, 0, 0)
             cr.paint()
 
-        # Draw finalized boxes
+        # Draw finalized boxes:
+        # To improve visibility over variable backgrounds, draw a darker shadow stroke
+        # then draw the dashed (white-ish) stroke on top. Selected box has animated dash.
         for i, rect in enumerate(self.boxes):
             x, y, w, h = rect['x'], rect['y'], rect['width'], rect['height']
-            if i == self.selected_index:
-                cr.set_source_rgba(1.0, 1.0, 1.0, 0.6)  # brighter for selected
-            else:
-                cr.set_source_rgba(1.0, 1.0, 1.0, 0.3)
-            cr.set_line_width(2)
+
+            # DRAW SHADOW (behind dashed stroke) for contrast
+            cr.set_line_width(6.0)
+            cr.set_source_rgba(0.0, 0.0, 0.0, 0.35)  # translucent black shadow
             cr.rectangle(x, y, w, h)
             cr.stroke()
 
-        # Draw the active box in red
+            # Draw dashed outline
+            if i == self.selected_index:
+                # Selected: brighter + animated dash offset
+                dash_pattern = [12.0, 6.0]
+                cr.set_line_width(3.0)
+                cr.set_source_rgba(1.0, 1.0, 1.0, 0.95)  # bright white
+                cr.set_dash(dash_pattern, self.dash_offset)
+                cr.rectangle(x, y, w, h)
+                cr.stroke()
+                cr.set_dash([], 0)  # clear
+            else:
+                # Unselected: lighter dashed border (static)
+                dash_pattern = [6.0, 6.0]
+                cr.set_line_width(2.0)
+                cr.set_source_rgba(1.0, 1.0, 1.0, 0.75)
+                cr.set_dash(dash_pattern, 0.0)
+                cr.rectangle(x, y, w, h)
+                cr.stroke()
+                cr.set_dash([], 0)
+
+        # Draw the active (being-drawn) box in translucent red on top of everything
         if self.drawing:
             rect = self.get_selection_rectangle()
             if rect:
@@ -86,7 +115,6 @@ class ScreenshotViewer(Gtk.DrawingArea):
                 cr.fill()
 
         return True
-
 
     def on_button_press(self, widget, event):
         if event.button == 1:
@@ -97,16 +125,13 @@ class ScreenshotViewer(Gtk.DrawingArea):
             self.end_y = event.y
             self.queue_draw()
 
-
     def on_motion_notify(self, widget, event):
         """Called when the mouse is dragged."""
         if not self.drawing:
-            return False  # or None; means no event handled
+            return False
 
-        # Update current mouse position
         self.end_x, self.end_y = event.x, event.y
 
-        # Update the selection rectangle dict
         self.rect = {
             'x': int(min(self.start_x, self.end_x)),
             'y': int(min(self.start_y, self.end_y)),
@@ -114,7 +139,6 @@ class ScreenshotViewer(Gtk.DrawingArea):
             'height': max(1, int(abs(self.end_y - self.start_y))),
         }
 
-        # Request redraw
         self.queue_draw()
         return True
 
@@ -122,33 +146,24 @@ class ScreenshotViewer(Gtk.DrawingArea):
         if event.button == Gdk.BUTTON_PRIMARY and self.drawing:
             self.end_x, self.end_y = event.x, event.y
 
-            dx = abs(self.end_x - self.start_x)
-            dy = abs(self.end_y - self.start_y)
-
-            # Uncomment below if you want to ignore very small accidental clicks
-            # if dx < 2 and dy < 2:
-            #     print("[DEBUG] Ignoring accidental click (too small)")
-            #     self.drawing = False
-            #     self.rect = None
-            #     self.queue_draw()
-            #     return True
-
             self.rect = self.get_selection_rectangle()
             print(f"[DEBUG] on_button_release: widget={widget.get_name()} "
-                f"type={event.type} button={event.button} x={event.x} y={event.y}")
+                  f"type={event.type} button={event.button} x={event.x} y={event.y}")
             print(f"[DEBUG] drawing={self.drawing}, rect={self.rect}")
 
             self.drawing = False
-            self.queue_draw()
-            if self.rect:  # emit only if box is valid
-                self.boxes.append(self.rect.copy())
-                if self.selection_callback:
-                    self.selection_callback(self.rect.copy(), len(self.boxes) - 1)
-                self.emit("box-drawn", self.rect)
 
+            if self.rect:
+                new_box = self.rect.copy()
+                new_box['id'] = len(self.boxes)
+                self.boxes.append(new_box)
+                if self.selection_callback:
+                    self.selection_callback(new_box.copy(), new_box['id'])
+                self.emit("box-drawn", new_box)
+
+            self.queue_draw()
             return True
         return False
-
 
     def get_selection_rectangle(self):
         x = int(min(self.start_x, self.end_x))
@@ -161,12 +176,44 @@ class ScreenshotViewer(Gtk.DrawingArea):
         if height == 0:
             height = 1
 
-        # Return a simple dict
         return {'x': x, 'y': y, 'width': width, 'height': height}
 
     def select_box(self, index):
-        """Highlight a given box visually."""
-        self.selected_index = index
+        """Highlight a given box visually (index is 0..len(self.boxes)-1)."""
+        # validate new selection
+        if index is None or index < 0 or index >= len(self.boxes):
+            self.selected_index = None
+            self._stop_dash_timer()
+        else:
+            self.selected_index = index
+            # ensure dash animation is running
+            self._start_dash_timer()
+        # reset dash offset so animation is consistent on new selection
+        self.dash_offset = 0.0
         self.queue_draw()
+
+    # ---- Animation helpers ----
+    def _on_dash_tick(self):
+        # Advance offset — value chosen to give smooth visible motion; tune as desired
+        self.dash_offset += 4.0
+        # keep offset bounded (optional)
+        if self.dash_offset > 10000:
+            self.dash_offset = self.dash_offset % 1000
+        self.queue_draw()
+        return True  # continue calling
+
+    def _start_dash_timer(self):
+        if self._dash_timer_id is None:
+            self._dash_timer_id = GLib.timeout_add(self._dash_interval_ms, self._on_dash_tick)
+            # immediate queue_draw to reflect starting state
+            self.queue_draw()
+
+    def _stop_dash_timer(self):
+        if self._dash_timer_id is not None:
+            try:
+                GLib.source_remove(self._dash_timer_id)
+            except Exception:
+                pass
+            self._dash_timer_id = None
 
 GObject.type_register(ScreenshotViewer)
