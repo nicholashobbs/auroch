@@ -30,11 +30,47 @@ class HostUI:
         self.selection_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self.selection_list.connect("row-selected", self.on_selection_clicked)
 
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        vbox.pack_start(self.screenshot_viewer, True, True, 0)
-        vbox.pack_start(self.selection_list, False, False, 0)
+        # Wrap the list in a scrollable container
+        self.selection_scroll = Gtk.ScrolledWindow()
+        self.selection_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.selection_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.selection_scroll.set_min_content_height(150)
+        self.selection_scroll.add(self.selection_list)
+        self.selection_scroll.set_size_request(200, 200)  # or whatever height you want
 
-        self.main_grid.attach(vbox, 0, 0, 1, 1)
+
+       # Create bottom horizontal layout
+        self.bottom_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.bottom_box.set_hexpand(True)
+
+        # Left: Selection list (fixed width)
+        self.selection_scroll.set_size_request(250, -1)  # fixed width, height auto
+        self.bottom_box.pack_start(self.selection_scroll, False, False, 0)
+
+        # Middle: Action panel placeholder (expandable)
+        self.middle_placeholder = Gtk.Label(label="(Apply Actions Panel Placeholder)")
+        self.middle_placeholder.set_hexpand(True)
+        self.middle_placeholder.set_vexpand(False)
+        self.bottom_box.pack_start(self.middle_placeholder, True, True, 0)
+
+        # Right: Action queue (fixed width)
+        self.right_placeholder = Gtk.Label(label="(Action Queue Placeholder)")
+        self.right_placeholder.set_size_request(250, -1)
+        self.bottom_box.pack_start(self.right_placeholder, False, False, 0)
+
+
+
+        self.main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        self.main_vbox.pack_start(self.screenshot_viewer, True, True, 0)
+        self.main_vbox.pack_start(self.bottom_box, False, False, 0)
+
+        self.main_vbox.set_hexpand(True)
+        self.main_vbox.set_vexpand(True)
+
+
+
+        self.main_grid.attach(self.main_vbox, 0, 0, 1, 1)
+
 
 
     def run(self):
@@ -55,13 +91,16 @@ class HostUI:
         label.set_margin_top(2)
         label.set_margin_bottom(2)
         row.add(label)
-        self.selection_list.add(row)
+        self.selection_list.insert(row, 0)  # Insert at the top
         self.selection_list.show_all()
+
 
     def on_selection_clicked(self, listbox, row):
         if row:
-            index = list(self.selection_list.get_children()).index(row)
-            self.screenshot_viewer.select_box(index)
+            visual_index = list(self.selection_list.get_children()).index(row)
+            actual_index = len(self.screenshot_viewer.boxes) - 1 - visual_index
+            self.screenshot_viewer.select_box(actual_index)
+
 
 if __name__ == "__main__":
     app = HostUI()
