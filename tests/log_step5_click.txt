@@ -1,8 +1,0 @@
---- AUROCH Action Plan Log ---
-Total Steps: 4
-
-Start Position: (5, 5)
-  - Step 1: PAUSE for 0.1593s (Total Sleep: 0.16s)
-  - Step 2: MOUSE_BTN LEFT PRESS
-  - Step 3: PAUSE for 0.0589s (Total Sleep: 0.22s)
-  - Step 4: MOUSE_BTN LEFT RELEASE

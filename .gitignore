@@ -6,3 +6,4 @@ gui/widgets/__pycache__/
 # Ignore test and host directories
 test/
 host/
+runs/

@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>Multimodal agent architecture&colon; deep dive and tradeoffs</title>
+            <style>
+/* From extension vscode.github */
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+.vscode-dark img[src$=\#gh-light-mode-only],
+.vscode-light img[src$=\#gh-dark-mode-only],
+.vscode-high-contrast:not(.vscode-high-contrast-light) img[src$=\#gh-light-mode-only],
+.vscode-high-contrast-light img[src$=\#gh-dark-mode-only] {
+	display: none;
+}
+
+</style>
+            
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/Microsoft/vscode/extensions/markdown-language-features/media/markdown.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/Microsoft/vscode/extensions/markdown-language-features/media/highlight.css">
+<style>
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe WPC', 'Segoe UI', system-ui, 'Ubuntu', 'Droid Sans', sans-serif;
+                font-size: 22px;
+                line-height: 1.6;
+            }
+        </style>
+        <style>
+.task-list-item {
+    list-style-type: none;
+}
+
+.task-list-item-checkbox {
+    margin-left: -20px;
+    vertical-align: middle;
+    pointer-events: none;
+}
+</style>
+<style>
+:root {
+  --color-note: #0969da;
+  --color-tip: #1a7f37;
+  --color-warning: #9a6700;
+  --color-severe: #bc4c00;
+  --color-caution: #d1242f;
+  --color-important: #8250df;
+}
+
+</style>
+<style>
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-note: #2f81f7;
+    --color-tip: #3fb950;
+    --color-warning: #d29922;
+    --color-severe: #db6d28;
+    --color-caution: #f85149;
+    --color-important: #a371f7;
+  }
+}
+
+</style>
+<style>
+.markdown-alert {
+  padding: 0.5rem 1rem;
+  margin-bottom: 16px;
+  color: inherit;
+  border-left: .25em solid #888;
+}
+
+.markdown-alert>:first-child {
+  margin-top: 0
+}
+
+.markdown-alert>:last-child {
+  margin-bottom: 0
+}
+
+.markdown-alert .markdown-alert-title {
+  display: flex;
+  font-weight: 500;
+  align-items: center;
+  line-height: 1
+}
+
+.markdown-alert .markdown-alert-title .octicon {
+  margin-right: 0.5rem;
+  display: inline-block;
+  overflow: visible !important;
+  vertical-align: text-bottom;
+  fill: currentColor;
+}
+
+.markdown-alert.markdown-alert-note {
+  border-left-color: var(--color-note);
+}
+
+.markdown-alert.markdown-alert-note .markdown-alert-title {
+  color: var(--color-note);
+}
+
+.markdown-alert.markdown-alert-important {
+  border-left-color: var(--color-important);
+}
+
+.markdown-alert.markdown-alert-important .markdown-alert-title {
+  color: var(--color-important);
+}
+
+.markdown-alert.markdown-alert-warning {
+  border-left-color: var(--color-warning);
+}
+
+.markdown-alert.markdown-alert-warning .markdown-alert-title {
+  color: var(--color-warning);
+}
+
+.markdown-alert.markdown-alert-tip {
+  border-left-color: var(--color-tip);
+}
+
+.markdown-alert.markdown-alert-tip .markdown-alert-title {
+  color: var(--color-tip);
+}
+
+.markdown-alert.markdown-alert-caution {
+  border-left-color: var(--color-caution);
+}
+
+.markdown-alert.markdown-alert-caution .markdown-alert-title {
+  color: var(--color-caution);
+}
+
+</style>
+        
+        </head>
+        <body class="vscode-body vscode-light">
+            <h1 id="multimodal-agent-architecture-deep-dive-and-tradeoffs">Multimodal agent architecture: deep dive and tradeoffs</h1>
+<p>You’re building an embodied, screen-native agent. The big design decision is how to combine perception (what’s on the screen?), grounding (what is each thing for?), and policy (what should I do next given my goal?). Below is a deep, implementation-level blueprint with concrete tradeoffs so you can spec the UI, data, and training loops with confidence.</p>
+<hr>
+<h2 id="vlm-vs-modular-pipeline-what-why-and-when">VLM vs modular pipeline: what, why, and when</h2>
+<h3 id="what-is-a-vlm">What is a VLM?</h3>
+<p>A vision-language model jointly encodes pixels and text tokens with cross-attention and can “read” a screenshot and produce text or structured outputs directly. It can also act as a planner if you prompt it with goal + screen.</p>
+<h3 id="what-is-a-modular-pipeline">What is a modular pipeline?</h3>
+<p>A set of specialized components: detector + OCR + layout/role classifier + planner + controller. Each is trained on targeted labels and stitched via a common UI graph/JSON.</p>
+<h3 id="strategic-comparison">Strategic comparison</h3>
+<table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>VLM-first agent</th>
+<th>Modular CV/OCR + LLM agent</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Perception accuracy</td>
+<td>Strong zero/few-shot on common UI patterns; may miss fine UI states (disabled, hidden)</td>
+<td>High with targeted labels; robust to small visual variants</td>
+</tr>
+<tr>
+<td>Data needs</td>
+<td>Less explicit supervision; benefits from instruction-tuning on your tasks</td>
+<td>Needs curated labels per module; cheaper per-label and easier to bootstrap synthetically</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Often higher; big context images + long responses</td>
+<td>Lower; small, specialized models; parallelizable</td>
+</tr>
+<tr>
+<td>Interpretability</td>
+<td>Low: “black-box” attention</td>
+<td>High: explicit elements, roles, states, confidences</td>
+</tr>
+<tr>
+<td>Controllability</td>
+<td>Hard to constrain outputs to safe actions</td>
+<td>Strong: validate pre/post-conditions before acting</td>
+</tr>
+<tr>
+<td>Failure modes</td>
+<td>Hallucination; overgeneralization</td>
+<td>Integration complexity; cascading module errors</td>
+</tr>
+<tr>
+<td>Incremental improvement</td>
+<td>Monolithic finetune</td>
+<td>Swap/finetune modules independently</td>
+</tr>
+<tr>
+<td>On-device feasibility</td>
+<td>Hard (size/memory)</td>
+<td>Plausible with quantized detectors/OCR/local LLM</td>
+</tr>
+<tr>
+<td>Data lifecycle</td>
+<td>Logs are textual; harder to tie to UI pixels</td>
+<td>Rich, structured telemetry for active learning</td>
+</tr>
+<tr>
+<td>Human-in-the-loop</td>
+<td>Hard to granularly correct</td>
+<td>Easy: correct boxes, roles, relations, plans</td>
+</tr>
+</tbody>
+</table>
+<p>Recommendation: use a hybrid. Let specialized perception build a structured UI graph; use a small planner model locally; selectively escalate to a VLM (local or remote) for ambiguous reasoning or unseen UI paradigms. This preserves speed, control, and data quality while keeping a “big brain” on call.</p>
+<hr>
+<h2 id="formalizing-the-problem">Formalizing the problem</h2>
+<ul>
+<li>State (\mathcal{S}): current screenshot, scroll offset, cursor, focus, and a structured UI graph.</li>
+<li>Actions (\mathcal{A}): move(x,y), click(kind), type(text), keypress(key), scroll(Δ), wait(cond), select(range), drag(start,end).</li>
+<li>Transition (T(s,a)): VM executes; returns new screenshot and events.</li>
+<li>Reward (R): sparse (goal completion), plus shaped rewards (field filled, page advanced, error avoided).</li>
+<li>Policy (\pi(a|s,g)): conditioned on goal (g) and state (s).</li>
+<li>Planner horizon: short (single step) for “reflex”; medium (N-step) for forms; long for multi-page flows.</li>
+</ul>
+<p>You’ll split this into perception (to build the UI graph) and control (to pick actions using that graph).</p>
+<hr>
+<h2 id="the-perception-stack-propose--verify--track">The perception stack (propose → verify → track)</h2>
+<h3 id="1-element-proposal-detector">1) Element proposal (detector)</h3>
+<ul>
+<li>Model: transformer-based detector (DETR-family) with custom classes.</li>
+<li>Outputs: bounding boxes, class logits, confidence.</li>
+<li>Classes: button, text_field, password_field, checkbox, radio, dropdown, link, image, icon, modal, toast, error, label, tab, pagination, captcha, hidden-like, disabled-like.</li>
+<li>Loss: Hungarian matching + L1 box + GIoU + class CE.</li>
+<li>Tricks:
+<ul>
+<li>Multi-scale features to catch tiny icons.</li>
+<li>Class-agnostic proposals + class head to reduce blind spots.</li>
+<li>Domain randomization with synthetic HTML renders to bootstrap.</li>
+</ul>
+</li>
+</ul>
+<h3 id="2-ocr-read-text-and-attributes">2) OCR (read text and attributes)</h3>
+<ul>
+<li>Model: high-accuracy OCR with bounding boxes and reading order; add a text-line detector if necessary.</li>
+<li>Outputs:
+<ul>
+<li>token: text, bbox, logit confidence</li>
+<li>attributes: font size, bold/italic, color, contrast estimates (weak proxy for affordance)</li>
+</ul>
+</li>
+<li>Post-process:
+<ul>
+<li>Merge tokens into lines/labels.</li>
+<li>Language detection for locale-aware patterns (dates, phone numbers).</li>
+</ul>
+</li>
+</ul>
+<h3 id="3-role-assignment-and-affordances">3) Role assignment and affordances</h3>
+<ul>
+<li>Inputs: detector boxes, OCR tokens, spatial relations.</li>
+<li>Tasks:
+<ul>
+<li>Role classification: map boxes to semantic roles beyond detector classes (primary_button, destructive_button, inline_link, nav_link, social_oauth, TOS_checkbox).</li>
+<li>Label association: link text labels to fields (via proximity, alignment, arrows/asterisks).</li>
+<li>State inference: {enabled/disabled, selected, focused, required, invalid}.</li>
+</ul>
+</li>
+<li>Model: graph neural net or transformer over an “element graph.”</li>
+<li>Outputs: a typed node set with attributes and confidences.</li>
+</ul>
+<h3 id="4-layout-and-structure">4) Layout and structure</h3>
+<ul>
+<li>Build a UI graph:
+<ul>
+<li>Nodes: elements with {bbox_norm, role, text, state, z-index order, visibility score, scroll_container_id}.</li>
+<li>Edges: spatial (above/below/left_of/overlaps), logical (label_for, described_by), containment (dom-like pane grouping), navigation (tab-order approximations via focus tests).</li>
+</ul>
+</li>
+<li>Maintain temporal correspondence across frames:
+<ul>
+<li>Element tracking via IoU + text fingerprint + embedding similarity.</li>
+<li>Assign persistent element_ids across scrolls and page changes.</li>
+</ul>
+</li>
+</ul>
+<h3 id="5-precondition-checks-safetyprecision">5) Precondition checks (safety/precision)</h3>
+<ul>
+<li>Validate clickability: overlap with hit region, not covered by modal, enabled, visible &gt; threshold, within viewport.</li>
+<li>Validate typing: caret/focus presence; fall back to click-then-type if needed.</li>
+</ul>
+<p>This stack yields a high-quality, explicit UI graph your planners can consume.</p>
+<hr>
+<h2 id="action-representation-and-dsl">Action representation and DSL</h2>
+<p>Define an action schema that’s both human-auditable and machine-trainable.</p>
+<ul>
+<li>Atomic actions:
+<ul>
+<li>move_to(element_id|x,y, strategy)</li>
+<li>click(element_id|x,y, button=left|right|middle, clicks=1|2)</li>
+<li>type_text(text, method=insert|replace)</li>
+<li>keypress(key), hotkey([keys])</li>
+<li>scroll(container_id|global, dy)</li>
+<li>wait_for(predicate, timeout_ms)</li>
+</ul>
+</li>
+<li>Predicates: element_visible(id), url_matches(regex), text_present(str), toast_contains(str), network_idle(ms)</li>
+<li>Macro actions (for planner to emit but expanded by executor):
+<ul>
+<li>focus_and_type(field_id, text, mask_policy)</li>
+<li>select_dropdown(option_text|index)</li>
+<li>dismiss_modal()</li>
+<li>navigate_back()</li>
+</ul>
+</li>
+</ul>
+<p>Represent planner outputs as JSON so you can log, diff, and replay.</p>
+<hr>
+<h2 id="planning-stack-reflex--tactical--strategic">Planning stack: reflex → tactical → strategic</h2>
+<h3 id="1-reflex-controller-local-small">1) Reflex controller (local, small)</h3>
+<ul>
+<li>Inputs: UI graph, current goal step.</li>
+<li>Outputs: next atomic action.</li>
+<li>Model: sequence model over serialized UI graph and goal step, trained via behavior cloning.</li>
+<li>Use cases: “click the ‘Sign up’ button,” “type email,” “scroll to reveal next field.”</li>
+<li>Training data: your labeled steps; DAgger-style corrections.</li>
+</ul>
+<h3 id="2-tactical-planner-local-llm-or-small-vlm">2) Tactical planner (local LLM or small VLM)</h3>
+<ul>
+<li>Inputs: full UI graph, short-horizon task (“complete this form”).</li>
+<li>Outputs: action plan (macro + atomics), with expected pre/post-conditions and per-step confidence.</li>
+<li>Reasoning mode: chain-of-state (no free-form chain-of-thought in prod); request missing info explicitly (“need password policy”).</li>
+<li>Calibration: temperature=low for determinism; abstain when confidence &lt; τ.</li>
+</ul>
+<h3 id="3-strategic-planner-optional-remote-llmvlm">3) Strategic planner (optional, remote LLM/VLM)</h3>
+<ul>
+<li>Inputs: long-horizon goal (“sign up for X, confirm email, set profile”).</li>
+<li>Outputs: subgoal decomposition and guardrails (success criteria, checkpoints).</li>
+<li>Triggered only when:
+<ul>
+<li>New domain with unfamiliar UI patterns.</li>
+<li>High uncertainty across multiple steps.</li>
+<li>Repeated failures or loops detected.</li>
+</ul>
+</li>
+</ul>
+<h3 id="arbitration-policy">Arbitration policy</h3>
+<ul>
+<li>Confidence gating:
+<ul>
+<li>If reflex confidence ≥ τ1 → execute.</li>
+<li>Else ask tactical. If tactical ≥ τ2 → execute.</li>
+<li>Else escalate to strategic or human.</li>
+</ul>
+</li>
+<li>Backoff on failure:
+<ul>
+<li>Roll back last N steps; try alternative candidates.</li>
+<li>If three consecutive failures → escalate.</li>
+</ul>
+</li>
+</ul>
+<h3 id="memory">Memory</h3>
+<ul>
+<li>Short-term: last K frames with element_id continuity.</li>
+<li>Episodic: per-domain heuristics learned (e.g., “login often in navbar top-right”).</li>
+<li>External: credential vault, PII policies, and templates.</li>
+</ul>
+<hr>
+<h2 id="learning-paradigms-and-losses">Learning paradigms and losses</h2>
+<h3 id="perception">Perception</h3>
+<ul>
+<li>Detection: DETR losses (Hungarian + L1 + GIoU + CE).</li>
+<li>OCR: CTC or seq2seq cross-entropy with augmentation.</li>
+<li>Role/state: cross-entropy; multi-label BCE for states.</li>
+<li>Tracking: contrastive loss to keep same-element embeddings close across frames; triplet loss for different elements.</li>
+</ul>
+<h3 id="policy">Policy</h3>
+<ul>
+<li>Behavior cloning:
+<ul>
+<li>Represent each step as (UI graph serialization, goal_step) → action.</li>
+<li>Loss: cross-entropy for discrete parts; L1 for coordinates; auxiliary loss on precondition prediction.</li>
+</ul>
+</li>
+<li>DAgger:
+<ul>
+<li>Run the current policy; allow human corrections; aggregate to dataset.</li>
+</ul>
+</li>
+<li>RL fine-tuning (optional, targeted):
+<ul>
+<li>On simulators or non-destructive sandboxes.</li>
+<li>Reward shaping: +1 for valid field filled, +5 for form submit, -1 for error dialog, small - for extraneous clicks.</li>
+<li>Algorithm: advantage actor-critic or offline RL with conservative Q-learning on logs.</li>
+</ul>
+</li>
+</ul>
+<h3 id="calibration-and-abstention">Calibration and abstention</h3>
+<ul>
+<li>Temperature scaling or Platt scaling on action logits.</li>
+<li>Monte Carlo dropout for uncertainty proxies on small models.</li>
+<li>Train a separate “can-I-do-this?” classifier over state-action pairs to decide when to escalate.</li>
+</ul>
+<hr>
+<h2 id="data-and-labeling-make-the-ui-earn-you-perfect-training-signals">Data and labeling: make the UI earn you perfect training signals</h2>
+<h3 id="ground-truth-objects-to-capture">Ground-truth objects to capture</h3>
+<ul>
+<li>Elements: bbox_norm [x1,y1,x2,y2], class, role, states, text, z-index, visibility score, scroll_container_id, element_id (persistent), confidence (if auto-proposed).</li>
+<li>Relations: label_for, described_by, within_modal, above/below/left_of, tab_order_index (approximate).</li>
+<li>OCR tokens: text, bbox, confidence, line_id.</li>
+<li>Actions: schema described earlier, actor=human|agent, success, error, retries, pre/post screenshots.</li>
+<li>Goals: episode_id, goal_text, subgoals, success criteria, stop reasons.</li>
+<li>Env: URL, viewport size, DPI, OS/browser skin, theme, locale.</li>
+<li>Outcome: success/failure, time-to-complete, human_interventions, reasons_for_intervention.</li>
+</ul>
+<h3 id="episode-structure">Episode structure</h3>
+<ul>
+<li>A “workflow” is an episode with steps; every step links to:
+<ul>
+<li>Input state (screenshot_id + UI graph hash)</li>
+<li>Intended action (gold)</li>
+<li>Candidate actions and scores (from models)</li>
+<li>Executed action and outcome</li>
+<li>Delta (DOM/text diff if available; otherwise visual diff + element graph diff)</li>
+</ul>
+</li>
+</ul>
+<h3 id="labeling-ui-must-haves">Labeling UI must-haves</h3>
+<ul>
+<li>Auto-propose boxes + roles + label links; accept/correct with single keystrokes.</li>
+<li>Bind label text to nearest field quickly (hover-to-link).</li>
+<li>Temporal linking tools: “same element across frames” one-click matcher.</li>
+<li>Step composer:
+<ul>
+<li>Pick element → choose action → set parameters (text) → define expected post-condition.</li>
+<li>Mark failures and provide the correct action (for DAgger).</li>
+</ul>
+</li>
+<li>Diff viewer: before/after screenshot + highlighted changed nodes.</li>
+<li>Uncertainty-first queue: active learning surfaces low-confidence or high-disagreement samples.</li>
+<li>Synthetic booster: load procedurally generated pages with known ground truth for fast labeling warm-start.</li>
+</ul>
+<h3 id="serialization-example">Serialization (example)</h3>
+<pre><code class="language-json"><span class="hljs-punctuation">{</span>
+  <span class="hljs-attr">&quot;episode_id&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-string">&quot;ep_2025-08-07T14:32Z_001&quot;</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">&quot;goal&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-string">&quot;Create account on example.com&quot;</span><span class="hljs-punctuation">,</span>
+  <span class="hljs-attr">&quot;steps&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-punctuation">[</span>
+    <span class="hljs-punctuation">{</span>
+      <span class="hljs-attr">&quot;step_id&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-number">1</span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">&quot;screenshot_id&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-string">&quot;img_001&quot;</span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">&quot;ui_graph&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-punctuation">{</span>
+        <span class="hljs-attr">&quot;elements&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-punctuation">[</span>
+          <span class="hljs-punctuation">{</span><span class="hljs-attr">&quot;element_id&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;e17&quot;</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;bbox&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-punctuation">[</span><span class="hljs-number">0.72</span><span class="hljs-punctuation">,</span><span class="hljs-number">0.12</span><span class="hljs-punctuation">,</span><span class="hljs-number">0.85</span><span class="hljs-punctuation">,</span><span class="hljs-number">0.17</span><span class="hljs-punctuation">]</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;role&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;button.primary&quot;</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;text&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;Sign up&quot;</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;state&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-punctuation">{</span><span class="hljs-attr">&quot;enabled&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-keyword">true</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;visible&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-keyword">true</span><span class="hljs-punctuation">}</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;z&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-number">9</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;container&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;root&quot;</span><span class="hljs-punctuation">}</span>
+        <span class="hljs-punctuation">]</span><span class="hljs-punctuation">,</span>
+        <span class="hljs-attr">&quot;relations&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-punctuation">[</span><span class="hljs-punctuation">{</span><span class="hljs-attr">&quot;type&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;above&quot;</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;src&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;e17&quot;</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;dst&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;e42&quot;</span><span class="hljs-punctuation">}</span><span class="hljs-punctuation">]</span>
+      <span class="hljs-punctuation">}</span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">&quot;action_intent&quot;</span><span class="hljs-punctuation">:</span> <span class="hljs-punctuation">{</span><span class="hljs-attr">&quot;type&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;click&quot;</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;target&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;e17&quot;</span><span class="hljs-punctuation">}</span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">&quot;candidates&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-punctuation">[</span>
+        <span class="hljs-punctuation">{</span><span class="hljs-attr">&quot;action&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-punctuation">{</span><span class="hljs-attr">&quot;type&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;click&quot;</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;target&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;e17&quot;</span><span class="hljs-punctuation">}</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;score&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-number">0.91</span><span class="hljs-punctuation">}</span><span class="hljs-punctuation">,</span>
+        <span class="hljs-punctuation">{</span><span class="hljs-attr">&quot;action&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-punctuation">{</span><span class="hljs-attr">&quot;type&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;click&quot;</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;target&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;e03&quot;</span><span class="hljs-punctuation">}</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;score&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-number">0.22</span><span class="hljs-punctuation">}</span>
+      <span class="hljs-punctuation">]</span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">&quot;executed_action&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-punctuation">{</span><span class="hljs-attr">&quot;type&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;click&quot;</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;target&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;e17&quot;</span><span class="hljs-punctuation">}</span><span class="hljs-punctuation">,</span>
+      <span class="hljs-attr">&quot;outcome&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-punctuation">{</span><span class="hljs-attr">&quot;success&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-keyword">true</span><span class="hljs-punctuation">,</span><span class="hljs-attr">&quot;post_screenshot_id&quot;</span><span class="hljs-punctuation">:</span><span class="hljs-string">&quot;img_002&quot;</span><span class="hljs-punctuation">}</span>
+    <span class="hljs-punctuation">}</span>
+  <span class="hljs-punctuation">]</span>
+<span class="hljs-punctuation">}</span>
+</code></pre>
+<hr>
+<h2 id="ui-graph-serialization-for-models">UI graph serialization for models</h2>
+<p>Serialize the graph into a token sequence for planners:</p>
+<ul>
+<li>Global header: goal, url domain, viewport.</li>
+<li>Element tokens: [ELEM id role x1 y1 x2 y2 visible enabled text_substr]</li>
+<li>Relation tokens: [REL id1 type id2]</li>
+<li>Container boundaries: [CONTAINER id start/end]</li>
+<li>Special tokens for focus, cursor, scroll offsets.</li>
+</ul>
+<p>Keep text truncated with hashes to preserve privacy while retaining matching ability.</p>
+<hr>
+<h2 id="execution-engine-and-feedback">Execution engine and feedback</h2>
+<ul>
+<li>Deterministic mouse paths: curved Bézier with randomization bounded by a reproducibility seed.</li>
+<li>Click validation: sample a few pixels inside target bbox to avoid off-by-one; verify state change or event.</li>
+<li>Text entry:
+<ul>
+<li>Prefer OS-level paste when allowed; otherwise per-keystroke with rate variance.</li>
+<li>Verify field value via OCR echo or by re-focusing and selecting-all → OCR.</li>
+</ul>
+</li>
+<li>Scroll strategy:
+<ul>
+<li>If element not visible, scroll container in small steps; after each, re-run cheap local detector on downsampled image to find target.</li>
+</ul>
+</li>
+<li>Recovery:
+<ul>
+<li>Detect popups/modals/toasts; attempt dismiss patterns; if destructive risk detected, abstain and escalate.</li>
+</ul>
+</li>
+</ul>
+<hr>
+<h2 id="escalation-and-human-in-the-loop">Escalation and human-in-the-loop</h2>
+<ul>
+<li>Triggers:
+<ul>
+<li>Confidence below thresholds.</li>
+<li>No progress after K steps or T seconds.</li>
+<li>Repeated unexpected state transitions (e.g., captcha, 2FA prompts).</li>
+</ul>
+</li>
+<li>Ask mode:
+<ul>
+<li>Present compact UI graph + top-3 candidate actions with scores.</li>
+<li>Human selects/edits; feedback captured as gold for DAgger.</li>
+</ul>
+</li>
+<li>Teach mode:
+<ul>
+<li>Human can define a macro (e.g., “OAuth via Google”) once; agent reuses by matching patterns later.</li>
+</ul>
+</li>
+</ul>
+<hr>
+<h2 id="synthetic-data-to-accelerate-cold-start">Synthetic data to accelerate cold start</h2>
+<ul>
+<li>Procedural HTML generation with variability:
+<ul>
+<li>Layouts: single/multi-column, stacked forms, wizards.</li>
+<li>Skins: light/dark, fonts, icon sets.</li>
+<li>Content: realistic labels with noise (typos, asterisks).</li>
+</ul>
+</li>
+<li>Render to images; export perfect ground-truth elements/relations.</li>
+<li>Domain randomization: jitter bbox, blur, scaling, noise to mimic VMs.</li>
+</ul>
+<hr>
+<h2 id="evaluation-suite">Evaluation suite</h2>
+<ul>
+<li>Perception:
+<ul>
+<li>mAP@IoU for detection.</li>
+<li>OCR word accuracy; character error rate.</li>
+<li>Role/state F1; label-field association accuracy.</li>
+<li>Tracking IDF1 across frames.</li>
+</ul>
+</li>
+<li>Control:
+<ul>
+<li>Task success rate per domain.</li>
+<li>Steps to success vs expert.</li>
+<li>Human interventions per 100 episodes.</li>
+<li>Action validity rate (preconditions met).</li>
+<li>Calibration: ECE for action confidence.</li>
+</ul>
+</li>
+<li>System:
+<ul>
+<li>End-to-end latency per step.</li>
+<li>Token/compute budget by tier (reflex/tactical/strategic).</li>
+<li>Robustness: theme swap, zoom levels, popups.</li>
+</ul>
+</li>
+</ul>
+<hr>
+<h2 id="model-choices-by-tier-representative-families">Model choices by tier (representative families)</h2>
+<ul>
+<li>Detector: DETR/Deformable-DETR variants; YOLOX/YOLOv8 as speed baselines.</li>
+<li>OCR: high-accuracy recognizer (seq2seq) + fast lightweight fallback; consider dictionary bias for emails/domains.</li>
+<li>Role/state: transformer over serialized graph with relative spatial encodings.</li>
+<li>Reflex policy: small encoder-decoder transformer distilled from tactical planner.</li>
+<li>Tactical planner: local LLM (4–13B) fine-tuned on your graph serialization; optionally conditioned on cropped element images.</li>
+<li>Strategic planner: remote LLM/VLM with tool-use restriction to planning; returns JSON-only plan.</li>
+</ul>
+<p>Quantize and distill aggressively; cache global screenshot embeddings across small DOM changes; use crop-level re-evaluation to save time.</p>
+<hr>
+<h2 id="security-privacy-and-safety-constraints-in-the-policy">Security, privacy, and safety constraints in the policy</h2>
+<ul>
+<li>PII handling: mask or synthesize data; disallow typing sensitive info unless explicitly authorized by goal.</li>
+<li>Destructive actions: require dual confirmation or human approval (delete, purchase).</li>
+<li>Domain allowlist/denylist; rate limits; honor robots/ToS constraints for automation where applicable.</li>
+</ul>
+<hr>
+<h2 id="putting-it-together-end-to-end-loop">Putting it together: end-to-end loop</h2>
+<ol>
+<li>Capture screenshot; compute quick-hash to reuse cached graph if trivial changes.</li>
+<li>Run detector + lightweight OCR; build/refresh UI graph and track element_ids.</li>
+<li>Validate candidate targets against preconditions.</li>
+<li>Try reflex policy. If low confidence, call tactical planner on serialized graph.</li>
+<li>Execute action via executor; verify post-condition (change in graph or predicate).</li>
+<li>If failure or low progress, alternative candidate; else escalate to strategic or human.</li>
+<li>Log everything for training: proposals, corrections, confidences, outcomes.</li>
+<li>Nightly:
+<ul>
+<li>Retrain detector/role on corrected labels.</li>
+<li>DAgger aggregate policy data.</li>
+<li>Distill tactical into reflex for speed.</li>
+<li>Recalibrate confidence thresholds.</li>
+</ul>
+</li>
+</ol>
+<hr>
+<h2 id="what-this-means-for-your-labeling-ui-spec">What this means for your labeling UI spec</h2>
+<ul>
+<li>Schema-first: implement the JSON above; every widget in the UI writes to that schema.</li>
+<li>Speed matters: all corrections must be one-keystroke operations; power annotators with bulk actions.</li>
+<li>Sequence-aware: the “step composer” is as important as the box tool—action, pre/post-conditions, and outcome are gold.</li>
+<li>Active learning: feed annotators the hardest/most-uncertain samples; you get 10× data value per minute.</li>
+<li>Temporal linking: make it trivial to say “this element equals that one in the next frame.”</li>
+<li>Macro definition: let humans define named macros; log matches when agent reuses them.</li>
+</ul>
+<hr>
+<h2 id="where-a-vlm-still-helps">Where a VLM still helps</h2>
+<ul>
+<li>Ambiguous icons, novel widgets, or dense dashboards where text cues are weak.</li>
+<li>Explaining unexpected states (“Your password must include …”) to adapt the plan.</li>
+<li>Generalizing layout heuristics across unseen design systems.</li>
+</ul>
+<p>Use it sparingly: pass in a compact, cropped panel or the serialized graph with thumbnails to keep token cost down; request JSON outputs with explicit action candidates and confidences; never let free-form text directly drive the executor.</p>
+<hr>
+<h2 id="open-design-choices-to-decide-and-i-can-help-you-nail-them">Open design choices to decide (and I can help you nail them)</h2>
+<ol>
+<li>Graph serialization format and max token budget for the local planner.</li>
+<li>Class taxonomy for roles/states that balances coverage and labeler effort.</li>
+<li>Confidence thresholds τ1/τ2 and failure backoff policy.</li>
+<li>Synthetic data generator spec (HTML components library and variation knobs).</li>
+<li>Which elements/relations to track across frames for stability vs cost.</li>
+<li>Privacy strategy for text logs (hashing, truncation, on-disk encryption).</li>
+</ol>
+<p>If you share a sample episode (screenshot + your current labeling JSON), I’ll tailor the taxonomy, serialization, and the active-learning loop to your exact needs—and we can wire the UI to produce training-perfect data from day one.</p>
+
+            
+            
+        </body>
+        </html>
