@@ -1,7 +1,8 @@
 syntax = "proto3";
 
 message Screenshot {
-  string filename = 1;
-  bytes image_data = 2;
-  int64 timestamp = 3;
+  string filename = 1;        // e.g. "shot_1723232345123.png"
+  bytes  image_data = 2;      // raw PNG bytes
+  int64  timestamp  = 3;      // ms since epoch (sender time)
+  bytes  ui_json    = 4;      // OPTIONAL: UTF-8 JSON for ui_graph.v1 (can be empty)
 }

@@ -1,5 +1,5 @@
 # ~/auroch/run_plan.py
-import argparse, json, time, zmq
+import argparse, json, time, zmq, random
 from pathlib import Path
 from handuz import Humanizer
 from datetime import datetime
@@ -8,15 +8,15 @@ import sys
 def ts_now():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
-def _center_of_box(box):
-    return (box['x'] + box['width'] // 2, box['y'] + box['height'] // 2)
-
 def _normalize_type_text(s: str) -> str:
     """
     Convert UI tokens into keystrokes that Humanizer understands.
     Currently: {ENTER} -> newline (Humanizer.type_text() sends Enter for '\n').
     """
     return (s or "").replace("{ENTER}", "\n")
+
+def _box_center(box):
+    return (box['x'] + box['width'] // 2, box['y'] + box['height'] // 2)
 
 def build_and_run(plan_path: Path, pi_ip: str, logs_dir: Path, dry_run: bool=False):
     if not plan_path.exists():
@@ -37,6 +37,37 @@ def build_and_run(plan_path: Path, pi_ip: str, logs_dir: Path, dry_run: bool=Fal
 
     boxes = obj["boxes"]
     actions = obj["actions"]
+
+    # --- (2) Random point within a box (avoid repeating last point per box) ---
+    last_point_by_box = {}  # box_id -> (x,y)
+
+    def rand_point_in_box(box_id: int):
+        b = boxes[box_id]
+        x0, y0, w, h = int(b['x']), int(b['y']), int(b['width']), int(b['height'])
+        # Guard tiny/invalid sizes
+        if w < 1 or h < 1:
+            pt = (x0, y0)
+            last_point_by_box[box_id] = pt
+            return pt
+
+        prev = last_point_by_box.get(box_id)
+        # Try a few times to avoid repeating the exact same point
+        for _ in range(6):
+            x = random.randint(x0, x0 + w - 1)
+            y = random.randint(y0, y0 + h - 1)
+            pt = (x, y)
+            if pt != prev:
+                last_point_by_box[box_id] = pt
+                return pt
+        # Fallback: nudge 1px horizontally if possible
+        if prev:
+            x = min(x0 + w - 1, max(x0, prev[0] + (1 if prev[0] < x0 + w - 1 else -1)))
+            y = prev[1]
+            pt = (x, y)
+        else:
+            pt = (x0, y0)
+        last_point_by_box[box_id] = pt
+        return pt
 
     # Expand to low-level HID actions via Humanizer
     h = Humanizer()
@@ -67,12 +98,19 @@ def build_and_run(plan_path: Path, pi_ip: str, logs_dir: Path, dry_run: bool=Fal
             if box_id is None or not (0 <= box_id < len(boxes)):
                 print(f"[WARN] MOVE missing/invalid box_id at step {idx}; skipping")
                 continue
-            x, y = _center_of_box(boxes[box_id])
+            x, y = rand_point_in_box(box_id)
             h.move_to(x, y); flush_h()
 
         elif atype == "CLICK":
+            if box_id is None or not (0 <= box_id < len(boxes)):
+                print(f"[WARN] CLICK missing/invalid box_id at step {idx}; skipping")
+                continue
+            # Always move to a random point in the target box, then click.
+            x, y = rand_point_in_box(box_id)
+            h.move_to(x, y); flush_h()
+
             btn = (params.get("button") or "Left").upper()
-            btn = {"LEFT":"LEFT","RIGHT":"RIGHT","MIDDLE":"MIDDLE"}.get(btn,"LEFT")
+            btn = {"LEFT":"LEFT","RIGHT":"RIGHT","MIDDLE":"MIDDLE"}.get(btn, "LEFT")
             h.click(btn); flush_h()
 
         elif atype == "TYPE":
@@ -90,11 +128,12 @@ def build_and_run(plan_path: Path, pi_ip: str, logs_dir: Path, dry_run: bool=Fal
         else:
             print(f"[WARN] Unknown action type '{atype}' at step {idx}; skipping")
 
-    # Log exactly what we’ll send (consistent timestamp format)
+    # --- (5) Log exactly what we wrote, and print a CREATED: line the UI can surface ---
     logs_dir.mkdir(parents=True, exist_ok=True)
     out_log = logs_dir / f"sent_plan_{ts_now()}.json"
     with open(out_log, 'w') as f:
         json.dump(final_actions, f, indent=2)
+    print(f"CREATED: {out_log}")  # <-- Rust UI will surface these lines
     print(f"--> Wrote low-level plan to {out_log}  (len={len(final_actions)})")
 
     if dry_run:

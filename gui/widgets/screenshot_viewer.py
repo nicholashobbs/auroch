@@ -51,10 +51,24 @@ class ScreenshotViewer(Gtk.DrawingArea):
         self._dash_timer_id = None           # GLib timer source id
         self._dash_interval_ms = 60         # update interval in ms (about ~16 FPS)
 
+        # --- ML overlay state ---
+        self.ui_graph = None
+        self.show_viewport  = False
+        self.show_containers= True
+        self.show_inputs    = True
+        self.show_buttons   = True
+        self.show_links     = True
+        self.show_ocr       = True
+        self.show_minimap   = False
+
     def load_image(self, image_path):
         print(f"DEBUG: 3. load_image called for '{image_path}'.")
         try:
             self.pixbuf = GdkPixbuf.Pixbuf.new_from_file(image_path)
+            w = self.pixbuf.get_width()
+            h = self.pixbuf.get_height()
+            self.set_size_request(w, h)
+
             self.queue_draw()
             return True
         except GLib.Error as e:
@@ -73,7 +87,7 @@ class ScreenshotViewer(Gtk.DrawingArea):
         if self.pixbuf:
             Gdk.cairo_set_source_pixbuf(cr, self.pixbuf, 0, 0)
             cr.paint()
-
+        self._draw_ml_overlays(cr)
         # Draw finalized boxes:
         # To improve visibility over variable backgrounds, draw a darker shadow stroke
         # then draw the dashed (white-ish) stroke on top. Selected box has animated dash.
@@ -178,6 +192,18 @@ class ScreenshotViewer(Gtk.DrawingArea):
 
         return {'x': x, 'y': y, 'width': width, 'height': height}
 
+    def clear_all_annotations(self):
+        """
+        Remove all user-drawn boxes/overlays for a fresh act.
+        """
+        try:
+            self.boxes = []
+        except Exception:
+            pass
+        self.selected_index = None
+        self._stop_dash_timer()
+        self.queue_draw()
+
     def select_box(self, index):
         """Highlight a given box visually (index is 0..len(self.boxes)-1)."""
         # validate new selection
@@ -190,6 +216,22 @@ class ScreenshotViewer(Gtk.DrawingArea):
             self._start_dash_timer()
         # reset dash offset so animation is consistent on new selection
         self.dash_offset = 0.0
+        self.queue_draw()
+    def set_ui_graph(self, graph: dict):
+        self.ui_graph = graph or {}
+        self.queue_draw()
+
+    def set_layer_visibility(self, kind: str, value: bool):
+        if   kind == "viewport":   self.show_viewport = bool(value)
+        elif kind == "containers": self.show_containers = bool(value)
+        elif kind == "inputs":     self.show_inputs = bool(value)
+        elif kind == "buttons":    self.show_buttons = bool(value)
+        elif kind == "links":      self.show_links = bool(value)
+        elif kind == "ocr":        self.show_ocr = bool(value)
+        self.queue_draw()
+
+    def set_minimap(self, on: bool):
+        self.show_minimap = bool(on)
         self.queue_draw()
 
     # ---- Animation helpers ----
@@ -215,5 +257,137 @@ class ScreenshotViewer(Gtk.DrawingArea):
             except Exception:
                 pass
             self._dash_timer_id = None
+    def _draw_translucent_rects(self, cr, rects, rgba, line_width=2.0):
+        # rgba: (r,g,b,a) in [0..1]
+        r,g,b,a = rgba
+        cr.set_source_rgba(r,g,b,a)
+        for b in rects:
+            x1,y1,x2,y2 = b
+            cr.rectangle(x1, y1, x2-x1, y2-y1)
+            cr.fill_preserve()
+            cr.set_line_width(line_width)
+            cr.stroke()
+
+    def _draw_gray_stipple(self, cr, rects):
+        if not rects: return
+        # create a small dot pattern
+        import cairo
+        pat_surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 8, 8)
+        ctx = cairo.Context(pat_surf)
+        ctx.set_source_rgba(0.5,0.5,0.5,0.25)  # light gray, low alpha
+        ctx.arc(2,2,1.5,0,6.283); ctx.fill()
+        ctx.arc(6,6,1.5,0,6.283); ctx.fill()
+        pattern = cairo.SurfacePattern(pat_surf)
+        pattern.set_extend(cairo.EXTEND_REPEAT)
+        cr.set_source(pattern)
+        # paint over each rect with pattern (use clip)
+        for b in rects:
+            x1,y1,x2,y2 = b
+            cr.save()
+            cr.rectangle(x1, y1, x2-x1, y2-y1)
+            cr.clip()
+            cr.paint_with_alpha(0.65)
+            cr.restore()
+
+    def _draw_viewport_mask(self, cr, full_w, full_h, keep_bbox):
+        # Darken outside keep_bbox, plus diagonal hatch
+        import cairo, math
+        x1,y1,x2,y2 = keep_bbox
+        # darken outside
+        cr.save()
+        cr.set_source_rgba(0,0,0,0.35)
+        cr.rectangle(0,0,full_w, full_h)
+        # clear keep area
+        cr.rectangle(x1,y1,x2-x1,y2-y1)
+        cr.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
+        cr.fill()
+        cr.restore()
+        # cross hatch
+        cr.save()
+        cr.set_source_rgba(0,0,0,0.10)
+        cr.set_line_width(1.0)
+        step = 16
+        # Diagonals (\/)
+        for d in range(-full_h, full_w, step):
+            cr.move_to(max(0,d), max(0,-d))
+            cr.line_to(min(full_w, d+full_h), min(full_h, full_h-d))
+        cr.stroke()
+        cr.restore()
+
+    def _draw_minimap(self, cr, W, H):
+        # White overlay, 75% opacity, then draw elements scaled 1:1 (we're already in image coords)
+        cr.save()
+        cr.set_source_rgba(1,1,1,0.75)
+        cr.rectangle(0,0,W,H)
+        cr.fill()
+        # Draw containers/elements/ocr words outlines + small text
+        graph = self.ui_graph or {}
+        import cairo
+        # Containers (medium gray)
+        conts = (graph.get("containers") or [])
+        self._draw_translucent_rects(cr, [c["bbox"] for c in conts], (0.5,0.5,0.5,0.35), line_width=2.0)
+        # Inputs (red), Buttons (green), Links (blue)
+        elems = (graph.get("elements") or [])
+        reds  = [e["bbox"] for e in elems if e.get("role")=="input"]
+        greens= [e["bbox"] for e in elems if e.get("role")=="button"]
+        blues = [e["bbox"] for e in elems if e.get("role")=="link_like"]
+        self._draw_translucent_rects(cr, reds,   (1.0,0.0,0.0,0.30), line_width=2.0)
+        self._draw_translucent_rects(cr, greens, (0.0,1.0,0.0,0.30), line_width=2.0)
+        self._draw_translucent_rects(cr, blues,  (0.0,0.4,1.0,0.30), line_width=2.0)
+        # OCR words: print tiny text
+        ocrw = ((graph.get("ocr") or {}).get("words") or [])
+        cr.set_source_rgba(0,0,0,0.9)
+        cr.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(10.0)
+        for w in ocrw[:1200]:
+            x1,y1,x2,y2 = w["bbox"]
+            txt = w.get("text","")
+            if not txt: continue
+            cr.move_to(x1+2, y1+12)
+            cr.show_text(txt[:32])
+        cr.restore()
+
+    def _draw_ml_overlays(self, cr):
+        # Early out if no graph
+        graph = self.ui_graph or {}
+        if not graph: return
+        W = int(graph.get("image_size",{}).get("w", 0) or 0)
+        H = int(graph.get("image_size",{}).get("h", 0) or 0)
+        if W <= 0 or H <= 0: return
+
+        # Minimap mode supersedes normal overlay drawing
+        if self.show_minimap:
+            self._draw_minimap(cr, W, H)
+            return
+
+        # Viewport mask
+        if self.show_viewport:
+            vp = (graph.get("viewport") or {}).get("bbox", [0,0,W,H])
+            self._draw_viewport_mask(cr, W, H, vp)
+
+        # Containers
+        if self.show_containers:
+            conts = (graph.get("containers") or [])
+            self._draw_translucent_rects(cr, [c["bbox"] for c in conts], (0.5,0.5,0.5,0.35), line_width=2.0)
+
+        elems = (graph.get("elements") or [])
+        # Inputs (red)
+        if self.show_inputs:
+            rects = [e["bbox"] for e in elems if e.get("role")=="input"]
+            self._draw_translucent_rects(cr, rects, (1.0,0.0,0.0,0.30), line_width=2.0)
+        # Buttons (green)
+        if self.show_buttons:
+            rects = [e["bbox"] for e in elems if e.get("role")=="button"]
+            self._draw_translucent_rects(cr, rects, (0.0,1.0,0.0,0.30), line_width=2.0)
+        # Links (blue)
+        if self.show_links:
+            rects = [e["bbox"] for e in elems if e.get("role")=="link_like"]
+            self._draw_translucent_rects(cr, rects, (0.0,0.4,1.0,0.30), line_width=2.0)
+
+        # OCR stipple
+        if self.show_ocr:
+            ocrw = ((graph.get("ocr") or {}).get("words") or [])
+            rects = [w["bbox"] for w in ocrw]
+            self._draw_gray_stipple(cr, rects)
 
 GObject.type_register(ScreenshotViewer)

@@ -7,6 +7,7 @@ import random
 import json
 import time
 import subprocess
+import socket
 from gi.repository import Gtk, GLib, Gdk, GdkPixbuf
 from pathlib import Path
 from widgets.screenshot_viewer import ScreenshotViewer
@@ -46,6 +47,10 @@ class HostUI:
         self.current_box_index = None  # actual index in screenshot_viewer.boxes
         self.action_queue = []         # list of action dicts
 
+        # --- Capture mode / VM state ---
+        self.capture_mode = "manual"   # "manual" | "changedet"
+        self.vm_is_muted  = None       # None until first control call succeeds
+
         # Bottom area layout: left fixed, middle expandable, right fixed
         self.bottom_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         self.bottom_box.set_hexpand(True)
@@ -63,6 +68,41 @@ class HostUI:
         self.action_builder_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.action_builder_box.set_hexpand(True)
         self.action_builder_box.set_vexpand(False)
+
+        # --- Screenshot Controls row (above action radios) ---
+        self.sshot_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.sshot_controls.set_halign(Gtk.Align.FILL)
+
+        # Mode radios
+        self.rb_manual = Gtk.RadioButton.new_with_label_from_widget(None, "Manual")
+        self.rb_changedet = Gtk.RadioButton.new_with_label_from_widget(self.rb_manual, "Change detect")
+        self.rb_manual.connect("toggled", self.on_mode_manual_selected)
+        self.rb_changedet.connect("toggled", self.on_mode_changedet_selected)
+
+        # Buttons
+        self.btn_capture_now = Gtk.Button(label="Capture now")
+        self.btn_capture_now.connect("clicked", self.on_capture_now_clicked)
+
+        self.btn_mute_toggle = Gtk.Button(label="Mute")  # toggles to Unmute
+        self.btn_mute_toggle.connect("clicked", self.on_mute_toggle_clicked)
+
+        # Status label (right aligned)
+        self.lbl_vm_status = Gtk.Label(label="VM: unknown", xalign=1.0)
+
+        # Layout: Mode radios on left, dynamic controls mid, status on right
+        self.sshot_controls.pack_start(Gtk.Label(label="Mode:"), False, False, 0)
+        self.sshot_controls.pack_start(self.rb_manual, False, False, 0)
+        self.sshot_controls.pack_start(self.rb_changedet, False, False, 0)
+        self.sshot_controls.pack_start(self.btn_capture_now, False, False, 0)
+        self.sshot_controls.pack_start(self.btn_mute_toggle, False, False, 0)
+        self.sshot_controls.pack_end(self.lbl_vm_status, False, False, 0)
+
+        # Default selection
+        self.rb_manual.set_active(True)
+        self._update_screenshot_controls_ui()
+
+        # Place this row ABOVE the action radios
+        self.action_builder_box.pack_start(self.sshot_controls, False, False, 0)
 
         # Action options (use RadioButtons for exclusive selection)
         self.action_options_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -162,11 +202,15 @@ class HostUI:
         right_controls_col.pack_start(self.export_btn, False, False, 0)
         right_controls_col.pack_start(self.load_btn, False, False, 0)
 
-
         # --- Pi IP entry ---
         self.pi_ip_entry = Gtk.Entry()
         self.pi_ip_entry.set_placeholder_text("Pi IP (e.g., 192.168.1.214)")
         self.pi_ip_entry.set_text("192.168.1.214")  # default; change as needed
+
+        # --- VM IP entry (Reflex control target on port 5002) ---
+        self.vm_ip_entry = Gtk.Entry()
+        self.vm_ip_entry.set_placeholder_text("VM IP (e.g., 192.168.1.220)")
+        self.vm_ip_entry.set_text("")  # leave blank until you fill it
 
 
         # --- Run Act button ---
@@ -175,8 +219,8 @@ class HostUI:
 
         # Add to right_controls_col (under Load/Export)
         right_controls_col.pack_start(self.pi_ip_entry, False, False, 0)
+        right_controls_col.pack_start(self.vm_ip_entry, False, False, 0)
         right_controls_col.pack_start(self.run_act_btn, False, False, 0)
-
 
         # Row that holds left & right control groups
         middle_bottom_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -188,6 +232,7 @@ class HostUI:
 
 
         # Assemble middle column (no "Action:" title)
+
         self.action_builder_box.pack_start(self.action_options_box, False, False, 0)
         self.action_builder_box.pack_start(self.param_box, True, True, 0)  # allow params to expand (esp. TYPE)
         self.action_builder_box.pack_end(middle_bottom_row, False, False, 0)
@@ -266,7 +311,55 @@ class HostUI:
         # Main vbox: top overlay, bottom controls
         self.main_vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         self.main_vbox.pack_start(self.overlay, True, True, 0)
+
+        # --- ML Layer toggle bar (ABOVE bottom UI) ---
+        self.layer_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.layer_bar.set_halign(Gtk.Align.FILL)
+
+        def _mk_cb(label):
+            cb = Gtk.CheckButton.new_with_label(label)
+            cb.set_active(True)
+            return cb
+
+        # Checkbuttons with dynamic counts
+        self.cb_viewport  = Gtk.CheckButton.new_with_label("Viewport (0)")
+        self.cb_containers= Gtk.CheckButton.new_with_label("Containers (0)")
+        self.cb_inputs    = Gtk.CheckButton.new_with_label("Inputs (0)")
+        self.cb_buttons   = Gtk.CheckButton.new_with_label("Buttons (0)")
+        self.cb_links     = Gtk.CheckButton.new_with_label("Links (0)")
+        self.cb_ocr       = Gtk.CheckButton.new_with_label("OCR (0)")
+
+        # Default visibility: viewport OFF, others ON
+        self.cb_viewport.set_active(False)
+        self.cb_containers.set_active(True)
+        self.cb_inputs.set_active(True)
+        self.cb_buttons.set_active(True)
+        self.cb_links.set_active(True)
+        self.cb_ocr.set_active(True)
+
+        # Wire events
+        self.cb_viewport.connect("toggled", lambda w: self._on_layer_toggled("viewport", w.get_active()))
+        self.cb_containers.connect("toggled", lambda w: self._on_layer_toggled("containers", w.get_active()))
+        self.cb_inputs.connect("toggled", lambda w: self._on_layer_toggled("inputs", w.get_active()))
+        self.cb_buttons.connect("toggled", lambda w: self._on_layer_toggled("buttons", w.get_active()))
+        self.cb_links.connect("toggled",   lambda w: self._on_layer_toggled("links", w.get_active()))
+        self.cb_ocr.connect("toggled",     lambda w: self._on_layer_toggled("ocr", w.get_active()))
+
+        # Minimap toggle
+        self.btn_minimap = Gtk.ToggleButton(label="Minimap")
+        self.btn_minimap.connect("toggled", self._on_minimap_toggled)
+
+        # Pack in order
+        for w in (self.cb_viewport, self.cb_containers, self.cb_inputs, self.cb_buttons, self.cb_links, self.cb_ocr):
+            self.layer_bar.pack_start(w, False, False, 0)
+        self.layer_bar.pack_end(self.btn_minimap, False, False, 0)
+
+        # add the bar ABOVE bottom UI
+        self.main_vbox.pack_start(self.layer_bar, False, False, 0)
+
+        # existing bottom UI
         self.main_vbox.pack_start(self.bottom_box, False, False, 0)
+
         self.main_vbox.set_hexpand(True)
         self.main_vbox.set_vexpand(True)
 
@@ -450,6 +543,39 @@ class HostUI:
 
         self.param_box.show_all()
         self._update_add_button_sensitivity()
+    def _set_layer_counts(self, graph: dict):
+        # Safely compute counts
+        elems = (graph or {}).get("elements", []) or []
+        ocrw  = ((graph or {}).get("ocr", {}) or {}).get("words", []) or []
+        conts = (graph or {}).get("containers", []) or []
+
+        n_inputs  = sum(1 for e in elems if e.get("role") == "input")
+        n_buttons = sum(1 for e in elems if e.get("role") == "button")
+        n_links   = sum(1 for e in elems if e.get("role") == "link_like")
+
+        self.cb_viewport.set_label("Viewport (1)")
+        self.cb_containers.set_label(f"Containers ({len(conts)})")
+        self.cb_inputs.set_label(f"Inputs ({n_inputs})")
+        self.cb_buttons.set_label(f"Buttons ({n_buttons})")
+        self.cb_links.set_label(f"Links ({n_links})")
+        self.cb_ocr.set_label(f"OCR ({len(ocrw)})")
+
+    def _on_layer_toggled(self, kind: str, value: bool):
+        if kind == "viewport":
+            self.screenshot_viewer.set_layer_visibility("viewport", value)
+        elif kind == "containers":
+            self.screenshot_viewer.set_layer_visibility("containers", value)
+        elif kind == "inputs":
+            self.screenshot_viewer.set_layer_visibility("inputs", value)
+        elif kind == "buttons":
+            self.screenshot_viewer.set_layer_visibility("buttons", value)
+        elif kind == "links":
+            self.screenshot_viewer.set_layer_visibility("links", value)
+        elif kind == "ocr":
+            self.screenshot_viewer.set_layer_visibility("ocr", value)
+
+    def _on_minimap_toggled(self, btn):
+        self.screenshot_viewer.set_minimap(btn.get_active())
 
     def _action_requires_box(self):
         # Only CLICK and MOVE strictly require a selected box
@@ -491,6 +617,83 @@ class HostUI:
         if self.rb_wake.get_active():   return "WAKE"
         return "CLICK"
 
+    def _update_screenshot_controls_ui(self):
+        """Show/hide buttons based on mode + vm_is_muted, and set status label."""
+        mode = getattr(self, "capture_mode", "manual")
+        self.capture_mode = mode  # normalize if missing
+        muted = getattr(self, "vm_is_muted", None)
+        self.vm_is_muted = muted
+
+        in_manual = (mode == "manual")
+        # Visibility / sensitivity
+        self.btn_capture_now.set_visible(in_manual)
+        self.btn_mute_toggle.set_visible(not in_manual)
+
+        # Mute button label in change-detect
+        if not in_manual:
+            if self.vm_is_muted is True:
+                self.btn_mute_toggle.set_label("Unmute")
+            elif self.vm_is_muted is False:
+                self.btn_mute_toggle.set_label("Mute")
+            else:
+                self.btn_mute_toggle.set_label("Mute")  # unknown -> default label
+
+        # Status label
+        if self.vm_is_muted is True:
+            self.lbl_vm_status.set_text("VM: muted")
+        elif self.vm_is_muted is False:
+            self.lbl_vm_status.set_text("VM: unmuted")
+        else:
+            self.lbl_vm_status.set_text("VM: unknown")
+
+    def on_mode_manual_selected(self, rb):
+        if not rb.get_active():
+            return
+        # Switch to manual -> mute VM long TTL
+        vm_ip = self.vm_ip_entry.get_text().strip()
+        if not vm_ip:
+            print("[ERROR] VM IP is required for control.")
+            return
+        ok = self._vm_send_ctl(vm_ip, 5002, {"cmd": "mute", "ttl_ms": 12 * 60 * 60 * 1000})
+        self.capture_mode = "manual"
+        self.vm_is_muted = True if ok else None
+        self._update_screenshot_controls_ui()
+
+    def on_mode_changedet_selected(self, rb):
+        if not rb.get_active():
+            return
+        # Switch to change-detect -> unmute VM
+        vm_ip = self.vm_ip_entry.get_text().strip()
+        if not vm_ip:
+            print("[ERROR] VM IP is required for control.")
+            return
+        ok = self._vm_send_ctl(vm_ip, 5002, {"cmd": "unmute"})
+        self.capture_mode = "changedet"
+        self.vm_is_muted = False if ok else None
+        self._update_screenshot_controls_ui()
+
+    def on_capture_now_clicked(self, btn):
+        vm_ip = self.vm_ip_entry.get_text().strip()
+        if not vm_ip:
+            print("[ERROR] VM IP is required for control.")
+            return
+        ok = self._vm_send_ctl(vm_ip, 5002, {"cmd": "capture_now"})
+        if not ok:
+            print("[WARN] Capture-now request failed.")
+
+    def on_mute_toggle_clicked(self, btn):
+        vm_ip = self.vm_ip_entry.get_text().strip()
+        if not vm_ip:
+            print("[ERROR] VM IP is required for control.")
+            return
+        # Toggle based on current belief
+        if self.vm_is_muted is True:
+            ok = self._vm_send_ctl(vm_ip, 5002, {"cmd": "unmute"})
+            self.vm_is_muted = False if ok else None
+        else:
+            ok = self._vm_send_ctl(vm_ip, 5002, {"cmd": "mute", "ttl_ms": 2 * 60 * 1000})
+            self.vm_is_muted = True if ok else None
+        self._update_screenshot_controls_ui()
 
     # Add action to queue (associate with current_box_index)
     def on_add_to_queue(self, btn):
@@ -769,46 +972,78 @@ class HostUI:
         if st.st_mtime <= self._latest_meta_mtime:
             return True  # nothing new
 
-        # something changed; parse it
+                # something changed; parse it
         try:
             obj = json.loads(latest_meta.read_text())
             latest_idx = int(obj.get("latest_index", 0))
-            latest_path = Path(obj.get("path", ""))
+            latest_img = obj.get("image_path") or obj.get("path", "")  # accept old "path" for bwd-compat
+            latest_ui  = obj.get("ui_path", "")
+            latest_image = Path(latest_img) if latest_img else None
+            latest_ui_path = Path(latest_ui) if latest_ui else None
         except Exception:
             return True
+
 
         self._latest_meta_mtime = st.st_mtime
         self.current_run_id = run_id
 
-        if latest_idx > self.current_shot_index and latest_path.exists():
-            # prepare thumbnail and show panel
+        if latest_idx > self.current_shot_index and latest_image and latest_image.exists():
             try:
-                thumb = self._load_grayscale_thumb(latest_path, scale=0.25)
+                thumb = self._load_grayscale_thumb(latest_image, scale=0.25)
                 self.next_thumb.set_from_pixbuf(thumb)
                 self.next_panel.set_visible(True)
-                # stash target path on the widget for click handler
-                self._next_image_path = latest_path
+                self._next_image_path = latest_image
+                self._next_ui_path = latest_ui_path if (latest_ui_path and latest_ui_path.exists()) else None
                 self._next_index_value = latest_idx
             except Exception as e:
                 print(f"[WARN] Failed to load next thumbnail: {e}")
 
+
+
         return True  # keep polling
 
     def _on_next_panel_clicked(self, *a):
-        # Load the pending image into the main viewer and hide the panel
-        if getattr(self, "_next_image_path", None):
-            try:
-                self.screenshot_viewer.load_image(str(self._next_image_path))
-                self.current_shot_index = getattr(self, "_next_index_value", self.current_shot_index)
+        """Accept the pending screenshot and its UI graph, then hide the panel."""
+        try:
+            img_path = getattr(self, "_next_image_path", None)
+            ui_path  = getattr(self, "_next_ui_path", None)
+            if not img_path:
+                self.next_panel.set_visible(False)
+                return
 
-                # New act context: clear current action queue and re-enable Run Act
-                self.action_queue = []
-                self._update_action_queue_ui()
-                self.run_act_btn.set_sensitive(True)
+            # Fresh slate for a new screenshot/act
+            self.reset_for_new_act()
 
-            except Exception as e:
-                print(f"[WARN] Failed to load next screenshot: {e}")
-        self.next_panel.set_visible(False)
+            # Load screenshot
+            self.screenshot_viewer.load_image(str(img_path))
+
+            # Load overlays if provided
+            graph = {}
+            if ui_path and ui_path.exists():
+                try:
+                    graph = json.loads(ui_path.read_text())
+                except Exception as e:
+                    print(f"[WARN] Failed to parse UI graph JSON: {e}")
+                    graph = {}
+
+            self.screenshot_viewer.set_ui_graph(graph)
+            self._set_layer_counts(graph)
+
+            # Apply current toggle states
+            self.screenshot_viewer.set_layer_visibility("viewport",   self.cb_viewport.get_active())
+            self.screenshot_viewer.set_layer_visibility("containers", self.cb_containers.get_active())
+            self.screenshot_viewer.set_layer_visibility("inputs",     self.cb_inputs.get_active())
+            self.screenshot_viewer.set_layer_visibility("buttons",    self.cb_buttons.get_active())
+            self.screenshot_viewer.set_layer_visibility("links",      self.cb_links.get_active())
+            self.screenshot_viewer.set_layer_visibility("ocr",        self.cb_ocr.get_active())
+
+            # Advance index and hide panel
+            self.current_shot_index = getattr(self, "_next_index_value", self.current_shot_index)
+        except Exception as e:
+            print(f"[WARN] Failed to load next screenshot: {e}")
+        finally:
+            self.next_panel.set_visible(False)
+
 
     def _vm_send_ctl(self, vm_ip: str, port: int, payload: dict, timeout=2.0):
         try:
@@ -912,6 +1147,7 @@ class HostUI:
             f.write(j)
 
         print(f"[INFO] Exported UI actions to {out_path}")
+    
     def on_run_act(self, btn):
         """
         Export current UI plan and execute via run_plan.py.
@@ -958,6 +1194,34 @@ class HostUI:
         except Exception as e:
             print(f"[ERROR] Could not execute run_plan: {e}")
             self.run_act_btn.set_sensitive(True)
+    
+    def reset_for_new_act(self):
+        """Fresh slate for a new screenshot/act: clear user boxes, lists, queue."""
+        # Clear viewer annotations
+        try:
+            self.screenshot_viewer.clear_all_annotations()
+        except Exception:
+            # If method missing, it will be added in ScreenshotViewer below.
+            self.screenshot_viewer.boxes = []
+            self.screenshot_viewer.queue_draw()
+
+        # Clear selection list
+        for child in list(self.selection_list.get_children()):
+            self.selection_list.remove(child)
+
+        # Clear queue
+        self.action_queue = []
+        self.action_queue_store.clear()
+
+        # Reset selection state and buttons
+        self.current_box_index = None
+        self.screenshot_viewer.select_box(None)
+        try:
+            self.delete_selection_btn.set_sensitive(False)
+            self.add_btn.set_sensitive(False)
+        except Exception:
+            pass
+        self._update_add_button_sensitivity()
 
 
     # run
